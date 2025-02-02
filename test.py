@@ -4,8 +4,7 @@ import threading
 import queue
 
 # ------------------------------------------------------------
-# 1) Police minimaliste 2×5 (chaque caractère = 2 colonnes × 5 lignes)
-#    '1' => pixel coloré (FG), '0' => pixel de fond (BG)
+# 1) Police 2×5 pour dessiner l'adresse
 # ------------------------------------------------------------
 CHAR_MAP_2x5 = {
     '0': ["11","10","10","10","11"],
@@ -29,12 +28,10 @@ CHAR_MAP_2x5 = {
     'e': ["00","10","11","10","01"],
     'f': ["01","10","11","10","10"],
     'x': ["00","10","01","10","00"]
-    # Ajoute d'autres caractères si nécessaire
 }
 
 # ------------------------------------------------------------
-# 2) Configuration : tokens, URL, couleurs, etc.
-#    Mets tous tes comptes pour poser en parallèle.
+# 2) Configuration : tokens, URL, cooldown, couleurs, etc.
 # ------------------------------------------------------------
 session_tokens = [
     "mUJRdKpDhJrnScmNsJWk04Z0phGLocr94jHFByD5jFbuGyAGgzM8nhcWUDY84jPG",  # compte 1
@@ -59,10 +56,9 @@ session_tokens = [
 ]
 
 url_place_pixel = "https://saloon.reniti.fr/api/v1/map/place"
-
-COOLDOWN = 21  # en secondes (cooldown individuel par compte)
-COLOR_BG = "0000ea"  # bleu (fond), sans le '#'
-COLOR_FG = "ffffff"  # blanc (trait), sans le '#'
+COOLDOWN = 21  # s (par compte)
+COLOR_BG = "0000ea"  # bleu
+COLOR_FG = "ffffff"  # blanc
 
 headers = {
     "Accept": "application/json, text/plain, */*",
@@ -77,88 +73,95 @@ headers = {
 }
 
 # ------------------------------------------------------------
-# 3) Texte à dessiner et position de départ
+# 3) Texte et position
 # ------------------------------------------------------------
 text_to_draw = "0xE5acF664aA782fE26695a53F0392a9cCD080e54A"
 start_x = 0
 start_y = 0
 
-# ------------------------------------------------------------
-# 4) Génération de la queue de pixels (x, y, color)
-#    => tous les pixels nécessaires pour dessiner le texte
-# ------------------------------------------------------------
-pixel_queue = queue.Queue()
-
-current_x = start_x
-for char in text_to_draw:
-    matrix = CHAR_MAP_2x5.get(char)
-    if not matrix:
-        # Caractère non défini -> saute 3 colonnes (2 + 1 espace)
-        current_x += 3
-        continue
+def build_pixel_queue():
+    """
+    Construit et renvoie la queue de tous les pixels à poser
+    pour l'adresse voulue, en 2×5.
+    """
+    pixel_q = queue.Queue()
+    current_x = start_x
     
-    # matrix = 5 lignes (row), chaque ligne = 2 colonnes (col)
-    for row in range(len(matrix)):       # row : 0..4
-        line = matrix[row]              # ex. "11"
-        for col in range(len(line)):    # col : 0..1
-            pixel_val = line[col]       # '0' ou '1'
-            color = COLOR_FG if pixel_val == '1' else COLOR_BG
-            x_coord = current_x + col
-            y_coord = start_y + row
-            pixel_queue.put((x_coord, y_coord, color))
-    
-    # On avance de 2 colonnes + 1 espace = 3
-    current_x += 3
+    for char in text_to_draw:
+        matrix = CHAR_MAP_2x5.get(char)
+        if not matrix:
+            # Caractère non défini -> saute 3 colonnes
+            current_x += 3
+            continue
+        
+        # Chaque matrice : 5 lignes, 2 colonnes
+        for row in range(len(matrix)):   # 5
+            line = matrix[row]          # ex: "10"
+            for col in range(len(line)):# 2
+                val = line[col]         # '1' ou '0'
+                color = COLOR_FG if val == '1' else COLOR_BG
+                x_coord = current_x + col
+                y_coord = start_y + row
+                pixel_q.put((x_coord, y_coord, color))
+        current_x += 3  # 2 col + 1 espace
+    return pixel_q
 
-# ------------------------------------------------------------
-# 5) Fonction thread : un compte place un pixel puis dort 21s
-# ------------------------------------------------------------
-def worker_func(token, thread_id):
-    """Récupère des pixels dans la queue, place un pixel, attend 21s, etc."""
+
+def place_pixel(token, thread_id, pixel_queue):
+    """
+    Un worker : prend un pixel, le place, dort 21 s, etc.,
+    jusqu'à vider la queue.
+    """
     while not pixel_queue.empty():
         try:
             x, y, color_hex = pixel_queue.get_nowait()
         except queue.Empty:
-            break  # plus rien à faire
+            break
         
-        cookies = {
-            "session.token": token,
-            "termsAccepted": "true"
-        }
-        data = {
-            "x": x,
-            "y": y,
-            "hexColor": color_hex
-        }
-        
+        # Requête POST
+        cookies = {"session.token": token, "termsAccepted": "true"}
+        data = {"x": x, "y": y, "hexColor": color_hex}
         resp = requests.post(url_place_pixel, headers=headers, cookies=cookies, json=data)
         
         if resp.status_code == 200:
-            print(f"[Thread {thread_id}] OK pixel ({x},{y}) color={color_hex}")
+            print(f"[Worker {thread_id}] OK pixel ({x},{y}) => {color_hex}")
         else:
-            print(f"[Thread {thread_id}] ERREUR {resp.status_code} => {resp.text} "
-                  f"pour pixel({x},{y})")
-
+            print(f"[Worker {thread_id}] ERREUR {resp.status_code} => {resp.text} (x={x},y={y})")
+        
         pixel_queue.task_done()
         
-        # Cooldown individuel
+        # Cooldown
         time.sleep(COOLDOWN)
+    
+    print(f"[Worker {thread_id}] terminé.")
 
-    print(f"[Thread {thread_id}] terminé : plus de pixels dans la queue ou queue vide.")
 
-# ------------------------------------------------------------
-# 6) Lancement des threads
-# ------------------------------------------------------------
-threads = []
-for i, token in enumerate(session_tokens, start=1):
-    t = threading.Thread(target=worker_func, args=(token, i))
-    threads.append(t)
-    t.start()
+def draw_loop():
+    """
+    Dessine la phrase en lançant un pool de threads (un par compte),
+    puis attend qu'ils terminent.
+    """
+    # Construire la queue
+    pix_queue = build_pixel_queue()
+    
+    # Lancer un thread par compte
+    threads = []
+    for i, token in enumerate(session_tokens, start=1):
+        t = threading.Thread(target=place_pixel, args=(token, i, pix_queue))
+        threads.append(t)
+        t.start()
+    
+    # Attendre la fin de la pose
+    for t in threads:
+        t.join()
+    
+    print("=== Fin de cette passe de dessin ===")
 
-# ------------------------------------------------------------
-# 7) Attendre la fin
-# ------------------------------------------------------------
-for t in threads:
-    t.join()
 
-print("Tous les pixels ont été posés. Fin du script.")
+if __name__ == "__main__":
+    # Boucle infinie : on redessine en permanence
+    while True:
+        draw_loop()
+        # Optionnel : petite pause avant de recommencer
+        time.sleep(60)  # si tu veux attendre 1 min avant de tout redessiner
+        # Sinon, on enchaîne direct
